@@ -175,73 +175,116 @@ def convert_to_markdown(doc_path, output_dir, logger, stats):
         # Create markdown content
         md_content = []
         in_code_block = False
-        code_indent = ""
         
         for paragraph in doc.paragraphs:
-            text = paragraph.text.strip()
-            if text:
-                # Handle heading styles
+            # Collect paragraph content in order
+            paragraph_content = []
+            
+            for run in paragraph.runs:
+                has_image = False
+                
+                # Check for images in this run
+                if hasattr(run, '_element'):
+                    for element in run._element.findall('.//w:drawing', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+                        try:
+                            inline_or_anchor = element.find('.//wp:inline', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
+                            if inline_or_anchor is None:
+                                inline_or_anchor = element.find('.//wp:anchor', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
+                            
+                            if inline_or_anchor is not None:
+                                blip = inline_or_anchor.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+                                if blip is not None:
+                                    rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                                    if rId in image_refs:
+                                        docPr = inline_or_anchor.find('.//wp:docPr', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
+                                        alt_text = docPr.get('descr', 'Image') if docPr is not None else 'Image'
+                                        alt_text = alt_text.replace('\n', ' ').strip()
+                                        
+                                        # Store the image markdown
+                                        paragraph_content.append({
+                                            'type': 'image',
+                                            'content': f"![{alt_text}]({image_refs[rId]})"
+                                        })
+                                        has_image = True
+                        except Exception as e:
+                            logger.warning(f"Failed to process inline image in {doc_name}: {str(e)}")
+                
+                # If run has text and wasn't completely replaced by an image
+                if run.text.strip() and not has_image:
+                    paragraph_content.append({
+                        'type': 'text',
+                        'content': run.text
+                    })
+            
+            # Process the collected content
+            if paragraph_content:
+                # Check if paragraph is a heading
                 heading_level = get_heading_level(paragraph)
                 if heading_level > 0:
                     if in_code_block:
-                        md_content.append("```\n")  # Close code block before heading
+                        md_content.append("```")
+                        md_content.append("")
                         in_code_block = False
-                    md_content.append(f"{'#' * heading_level} {text}")
+                    
+                    # Combine all text content for heading
+                    heading_text = ''.join(item['content'] for item in paragraph_content if item['type'] == 'text')
+                    md_content.append(f"{'#' * heading_level} {heading_text}")
                 else:
-                    # Check if this might be a code block
-                    if (paragraph.style.name.lower().startswith('code') or 
-                        text.startswith('    ') or 
-                        any(run.font.name in ['Consolas', 'Courier New'] for run in paragraph.runs)):
+                    # Handle regular paragraph or code block
+                    is_code = (
+                        paragraph.style.name.lower().startswith('code') or
+                        all(run.font.name in ['Consolas', 'Courier New'] for run in paragraph.runs if run.font)
+                    )
+                    
+                    if is_code:
                         if not in_code_block:
+                            md_content.append("")
                             md_content.append("```")
                             in_code_block = True
-                        md_content.append(text)
+                        # Combine all text content for code
+                        code_text = ''.join(item['content'] for item in paragraph_content if item['type'] == 'text')
+                        md_content.append(code_text.replace('\t', '    '))
                     else:
                         if in_code_block:
-                            md_content.append("```\n")
+                            md_content.append("```")
+                            md_content.append("")
                             in_code_block = False
                         
-                        # Handle images in paragraph
-                        processed_text = text
-                        for run in paragraph.runs:
-                            if hasattr(run, '_element'):
-                                for element in run._element.findall('.//w:drawing', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
-                                    try:
-                                        inline_or_anchor = element.find('.//wp:inline', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
-                                        if inline_or_anchor is None:
-                                            inline_or_anchor = element.find('.//wp:anchor', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
-                                        
-                                        if inline_or_anchor is not None:
-                                            blip = inline_or_anchor.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
-                                            if blip is not None:
-                                                rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                                                if rId in image_refs:
-                                                    # Get alt text if available
-                                                    docPr = inline_or_anchor.find('.//wp:docPr', {'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'})
-                                                    alt_text = docPr.get('descr', 'Image') if docPr is not None else 'Image'
-                                                    
-                                                    # Create markdown image with proper newlines
-                                                    img_markdown = f"\n![{alt_text}]({image_refs[rId]})\n"
-                                                    processed_text = processed_text.replace(run.text, img_markdown)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to process inline image in {doc_name}: {str(e)}")
-                        
-                        md_content.append(processed_text)
+                        # If paragraph contains only one image
+                        if len(paragraph_content) == 1 and paragraph_content[0]['type'] == 'image':
+                            md_content.append("")
+                            md_content.append(paragraph_content[0]['content'])
+                            md_content.append("")
+                        else:
+                            # Combine content preserving order
+                            combined_content = ''.join(item['content'] for item in paragraph_content)
+                            if combined_content.strip():
+                                md_content.append(combined_content)
             else:
                 # Handle empty lines
-                if in_code_block:
-                    md_content.append("")  # Preserve empty lines in code blocks
-                else:
+                if not in_code_block:
                     md_content.append("")
         
         # Close any open code block
         if in_code_block:
             md_content.append("```")
+            md_content.append("")
+        
+        # Clean up multiple consecutive blank lines
+        cleaned_content = []
+        last_was_blank = False
+        for line in md_content:
+            if line.strip():
+                cleaned_content.append(line)
+                last_was_blank = False
+            elif not last_was_blank:
+                cleaned_content.append(line)
+                last_was_blank = True
         
         # Save markdown file
         output_path = os.path.join(target_dir, f"{doc_name}.md")
         with open(output_path, 'w', encoding='utf-8') as md_file:
-            md_file.write('\n'.join(md_content))
+            md_file.write('\n'.join(cleaned_content))
         
         logger.info(f"Successfully converted {doc_path} to {output_path}")
         stats.successful_files.append(doc_path)
